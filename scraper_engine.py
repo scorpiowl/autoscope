@@ -249,6 +249,35 @@ def build_public_teaser_site(leads: list):
     (out_dir / "index.html").write_text(page_html, encoding="utf-8")
     print("[INFO] Built public/index.html teaser page.")
 
+def build_rss_feed(leads: list):
+    out_dir = Path("public")
+    out_dir.mkdir(exist_ok=True)
+    pub_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+    items_xml = ""
+    for l in leads[:5]:
+        items_xml += f"""
+        <item>
+          <title>{html.escape(l['title'])} [{html.escape(l['keywords'])}]</title>
+          <link>{html.escape(GUMROAD_CHECKOUT_URL)}</link>
+          <description>Matched Keywords: {html.escape(l['keywords'])} (Score: {l['score']}). Unlock direct client link and outreach template on AutoScope.</description>
+          <pubDate>{pub_date}</pubDate>
+          <guid isPermaLink="false">{html.escape(l['url'])}</guid>
+        </item>"""
+
+    rss_xml = f"""<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0">
+  <channel>
+    <title>AutoScope Daily High-Intent Contract Feed</title>
+    <link>{html.escape(GUMROAD_CHECKOUT_URL)}</link>
+    <description>Daily Python, Scraping, VBA, and Apps Script Contracts</description>
+    {items_xml}
+  </channel>
+</rss>"""
+
+    (out_dir / "rss.xml").write_text(rss_xml, encoding="utf-8")
+    print("[INFO] Built public/rss.xml syndication feed.")
+
 
 def main():
     all_leads = scrape_reddit_forhire() + scrape_remoteok()
@@ -258,6 +287,7 @@ def main():
     subscribers = sync_with_google_sheets(all_leads)
     send_daily_digest(subscribers, all_leads)
     build_public_teaser_site(all_leads)
+    build_rss_feed(all_leads)
 
 
 if __name__ == "__main__":
