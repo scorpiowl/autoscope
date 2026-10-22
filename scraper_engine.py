@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
 FILE: scraper_engine.py
-Automated B2B Lead Aggregator, Webhook Sync, Email Dispatcher, and Landing Page Builder.
+Automated B2B Lead Aggregator (Reddit, RemoteOK, Hacker News, Python.org),
+Webhook Sync, Email Dispatcher, Static Site & RSS Builder.
 """
 
 import os
+import re
 import json
 import html
 import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,7 +22,6 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "onboarding@resend.dev")
 GUMROAD_CHECKOUT_URL = os.environ.get("GUMROAD_CHECKOUT_URL", "https://gumroad.com")
 
-# Target high-intent technical keywords and weighting scores
 KEYWORD_WEIGHTS = {
     "python": 3,
     "scrape": 4,
@@ -34,17 +37,27 @@ KEYWORD_WEIGHTS = {
     "api": 3,
     "webhook": 4,
     "etl": 4,
+    "pipeline": 3,
     "script": 3,
     "bot": 3,
 }
 
-USER_AGENT = "Mozilla/5.0 (compatible; AutoScopeLeadBot/1.0; +https://github.com)"
+USER_AGENT = "Mozilla/5.0 (compatible; AutoScopeLeadBot/2.0; +https://github.com)"
+
+
+def fetch_url(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read()
 
 
 def fetch_json(url: str):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    return json.loads(fetch_url(url).decode("utf-8"))
+
+
+def strip_html(raw_html: str) -> str:
+    clean = re.sub(r"<[^>]+>", " ", html.unescape(raw_html or ""))
+    return re.sub(r"\s+", " ", clean).strip()
 
 
 def score_and_enrich(title: str, description: str, url: str, source: str):
@@ -61,15 +74,16 @@ def score_and_enrich(title: str, description: str, url: str, source: str):
         return None
 
     kw_str = ", ".join(matched_keywords[:4])
+    clean_title = title.strip()[:80]
     pitch = (
-        f"Hi — saw your post regarding '{title[:55]}...'. I specialize in {kw_str} "
+        f"Hi — saw your listing regarding '{clean_title}'. I specialize in {kw_str} "
         f"workflows and can deploy a clean, documented solution within 24-48 hours. "
         f"Happy to share a quick architecture outline if this is still open."
     )
 
     return {
         "source": source,
-        "title": title.strip(),
+        "title": clean_title,
         "keywords": kw_str,
         "score": score,
         "url": url,
@@ -86,7 +100,6 @@ def scrape_reddit_forhire():
         for post in posts:
             p = post.get("data", {})
             title = p.get("title", "")
-            # Filter strictly for [Hiring] posts
             if "[hiring]" not in title.lower():
                 continue
             selftext = p.get("selftext", "")
@@ -104,9 +117,9 @@ def scrape_remoteok():
     url = "https://remoteok.com/api"
     try:
         data = fetch_json(url)
-        for item in data[1:50]:  # Skip legal notice at index 0
+        for item in data[1:50]:
             title = item.get("position", "")
-            desc = item.get("description", "")
+            desc = strip_html(item.get("description", ""))
             tags = " ".join(item.get("tags", []))
             link = item.get("url", "")
             enriched = score_and_enrich(title, f"{desc} {tags}", link, "RemoteOK")
@@ -114,6 +127,49 @@ def scrape_remoteok():
                 leads.append(enriched)
     except Exception as e:
         print(f"[WARN] RemoteOK scrape error: {e}")
+    return leads
+
+
+def scrape_hackernews():
+    leads = []
+    query = urllib.parse.quote("python automation OR scraping OR contract OR freelance")
+    url = f"https://hn.algolia.com/api/v1/search_by_date?tags=comment&query={query}&hitsPerPage=50"
+    try:
+        data = fetch_json(url)
+        for hit in data.get("hits", []):
+            story_title = (hit.get("story_title") or "").lower()
+            if "who is hiring" not in story_title and "hiring" not in story_title:
+                continue
+            raw_comment = hit.get("comment_text") or ""
+            clean_comment = strip_html(raw_comment)
+            if not clean_comment:
+                continue
+            first_line = clean_comment.split(".")[0][:75]
+            title = f"HN Hiring: {first_line}"
+            link = f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
+            enriched = score_and_enrich(title, clean_comment, link, "Hacker News")
+            if enriched:
+                leads.append(enriched)
+    except Exception as e:
+        print(f"[WARN] Hacker News scrape error: {e}")
+    return leads
+
+
+def scrape_python_org_jobs():
+    leads = []
+    url = "https://www.python.org/jobs/feed/rss/"
+    try:
+        xml_bytes = fetch_url(url)
+        root = ET.fromstring(xml_bytes)
+        for item in root.findall(".//item")[:40]:
+            title = item.findtext("title") or ""
+            desc = strip_html(item.findtext("description") or "")
+            link = item.findtext("link") or ""
+            enriched = score_and_enrich(title, desc, link, "Python.org Jobs")
+            if enriched:
+                leads.append(enriched)
+    except Exception as e:
+        print(f"[WARN] Python.org RSS scrape error: {e}")
     return leads
 
 
@@ -174,7 +230,7 @@ def send_daily_digest(subscribers: list, leads: list):
     </div>
     """
 
-    for sub_email in subscribers[:95]:  # Respects Resend 100/day free cap
+    for sub_email in subscribers[:95]:
         payload = json.dumps({
             "from": SENDER_EMAIL,
             "to": [sub_email],
@@ -204,7 +260,7 @@ def build_public_teaser_site(leads: list):
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     teaser_rows = ""
-    for l in leads[:8]:
+    for l in leads[:10]:
         teaser_rows += f"""
         <div class="card">
           <div class="badge">Score: {l['score']} | {html.escape(l['source'])}</div>
@@ -234,7 +290,7 @@ def build_public_teaser_site(leads: list):
 <body>
   <header>
     <h1>AutoScope Contract Feed</h1>
-    <p>Automated daily discovery of high-intent Python, Scraping, VBA, and Apps Script contracts. Last updated: {today_str}</p>
+    <p>Automated daily discovery of high-intent Python, Scraping, VBA, and Apps Script contracts across Reddit, Hacker News, RemoteOK, and Python.org. Last updated: {today_str}</p>
   </header>
   <div class="cta-box">
     <h2>Get Unredacted Instant Access + Daily 7 AM Digest</h2>
@@ -249,6 +305,7 @@ def build_public_teaser_site(leads: list):
     (out_dir / "index.html").write_text(page_html, encoding="utf-8")
     print("[INFO] Built public/index.html teaser page.")
 
+
 def build_rss_feed(leads: list):
     out_dir = Path("public")
     out_dir.mkdir(exist_ok=True)
@@ -260,7 +317,7 @@ def build_rss_feed(leads: list):
         <item>
           <title>{html.escape(l['title'])} [{html.escape(l['keywords'])}]</title>
           <link>{html.escape(GUMROAD_CHECKOUT_URL)}</link>
-          <description>Matched Keywords: {html.escape(l['keywords'])} (Score: {l['score']}). Unlock direct client link and outreach template on AutoScope.</description>
+          <description>Source: {html.escape(l['source'])} | Matched Keywords: {html.escape(l['keywords'])} (Score: {l['score']}). Unlock direct client link and outreach template on AutoScope.</description>
           <pubDate>{pub_date}</pubDate>
           <guid isPermaLink="false">{html.escape(l['url'])}</guid>
         </item>"""
@@ -280,9 +337,17 @@ def build_rss_feed(leads: list):
 
 
 def main():
-    all_leads = scrape_reddit_forhire() + scrape_remoteok()
-    all_leads.sort(key=lambda x: x["score"], reverse=True)
-    print(f"[INFO] Total high-intent leads scored: {len(all_leads)}")
+    raw_leads = (
+        scrape_reddit_forhire()
+        + scrape_remoteok()
+        + scrape_hackernews()
+        + scrape_python_org_jobs()
+    )
+
+    # Deduplicate by URL and sort highest score first
+    deduped = {lead["url"]: lead for lead in raw_leads}
+    all_leads = sorted(deduped.values(), key=lambda x: x["score"], reverse=True)
+    print(f"[INFO] Total unique high-intent leads scored: {len(all_leads)}")
 
     subscribers = sync_with_google_sheets(all_leads)
     send_daily_digest(subscribers, all_leads)
